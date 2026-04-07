@@ -35,15 +35,21 @@ public class VisitorCounterHandler
             .build();
 
     private final VisitorService visitorService;
+    // Restricts CORS to the CloudFront origin. Falls back to "*" when the env
+    // var is absent (local testing via sam local or unit tests).
+    private final String allowedOrigin;
 
     /** Production constructor — uses real AWS clients. */
     public VisitorCounterHandler() {
         this.visitorService = new VisitorService(DYNAMO, SQS);
+        String cfUrl = System.getenv("CLOUDFRONT_URL");
+        this.allowedOrigin = (cfUrl != null && !cfUrl.isBlank()) ? cfUrl : "*";
     }
 
     /** Test constructor — inject mock service. */
     public VisitorCounterHandler(VisitorService visitorService) {
         this.visitorService = visitorService;
+        this.allowedOrigin = "*";
     }
 
     @Override
@@ -99,13 +105,12 @@ public class VisitorCounterHandler
      * Falls back to a timestamp-based token so the counter always increments.
      */
     private String resolveVisitorId(APIGatewayProxyRequestEvent request) {
-        try {
-            var identity = request.getRequestContext().getIdentity();
+        var ctx = request.getRequestContext();
+        if (ctx != null) {
+            var identity = ctx.getIdentity();
             if (identity != null && identity.getSourceIp() != null) {
                 return identity.getSourceIp();
             }
-        } catch (NullPointerException ignored) {
-            // Request context absent (e.g., local testing)
         }
         return "anon-" + System.currentTimeMillis();
     }
@@ -136,7 +141,7 @@ public class VisitorCounterHandler
     private Map<String, String> corsHeaders() {
         return Map.of(
                 "Content-Type", "application/json",
-                "Access-Control-Allow-Origin", "*",
+                "Access-Control-Allow-Origin", allowedOrigin,
                 "Access-Control-Allow-Methods", "GET,POST,OPTIONS",
                 "Access-Control-Allow-Headers", "Content-Type,X-Amz-Date,Authorization,X-Api-Key"
         );

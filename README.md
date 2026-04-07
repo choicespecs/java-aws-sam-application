@@ -222,5 +222,6 @@ aws sns list-subscriptions-by-topic \
 | [`docs/architecture.md`](docs/architecture.md) | Component diagram, data model, IAM boundaries |
 | [`docs/decisions.md`](docs/decisions.md) | Architecture Decision Records — why each technology was chosen |
 | [`docs/flow.md`](docs/flow.md) | Step-by-step request and data flows |
+| [`docs/sdk.md`](docs/sdk.md) | AWS SDK for Java v2 — client setup, every API call, request/response model, error handling |
 | [`docs/console-guide.md`](docs/console-guide.md) | AWS Console monitoring guide — what to look at in each service |
 | [`DEPLOYMENT.md`](DEPLOYMENT.md) | AWS CLI deployment, local dev, teardown |

@@ -69,7 +69,12 @@ public class VisitorService {
                     .build());
 
             if (response.hasItem() && response.item().containsKey("count")) {
-                return Long.parseLong(response.item().get("count").n());
+                try {
+                    return Long.parseLong(response.item().get("count").n());
+                } catch (NumberFormatException e) {
+                    log.error("Corrupt count value in DynamoDB: {}", response.item().get("count").n());
+                    throw new RuntimeException("Counter data is corrupt", e);
+                }
             }
             return 0L;
 
@@ -112,9 +117,14 @@ public class VisitorService {
                     .returnValues(ReturnValue.UPDATED_NEW)
                     .build());
 
-            long newCount = Long.parseLong(response.attributes().get("count").n());
-            log.info("Counter incremented to {}", newCount);
-            return newCount;
+            try {
+                long newCount = Long.parseLong(response.attributes().get("count").n());
+                log.info("Counter incremented to {}", newCount);
+                return newCount;
+            } catch (NumberFormatException e) {
+                log.error("Corrupt count value after UpdateItem: {}", response.attributes().get("count").n());
+                throw new RuntimeException("Counter data is corrupt after increment", e);
+            }
 
         } catch (DynamoDbException e) {
             log.error("DynamoDB UpdateItem failed", e);

@@ -5,6 +5,7 @@ import com.amazonaws.services.lambda.runtime.RequestHandler;
 import com.amazonaws.services.lambda.runtime.events.SQSBatchResponse;
 import com.amazonaws.services.lambda.runtime.events.SQSEvent;
 import com.example.service.NotificationService;
+import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -27,7 +28,22 @@ import java.util.List;
 public class SQSProcessorHandler implements RequestHandler<SQSEvent, SQSBatchResponse> {
 
     private static final Logger log = LoggerFactory.getLogger(SQSProcessorHandler.class);
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    // Cap JSON parsing to the realistic maximum for an SQS visit-event message.
+    // SQS itself limits messages to 256 KB, but setting tighter limits here
+    // prevents a crafted message from exhausting Lambda memory via deeply nested
+    // structures or enormous strings before Jackson's own OOM kicks in.
+    private static final ObjectMapper MAPPER;
+    static {
+        MAPPER = new ObjectMapper();
+        MAPPER.getFactory().setStreamReadConstraints(
+                StreamReadConstraints.builder()
+                        .maxStringLength(1_024)   // far above any real IP / timestamp
+                        .maxNestingDepth(4)        // our payload is flat ({k:v, k:v, k:v})
+                        .maxNumberLength(20)       // long has at most 19 digits
+                        .build()
+        );
+    }
 
     /** Send a notification every N visitors. */
     static final long MILESTONE_INTERVAL = 100;
@@ -83,8 +99,11 @@ public class SQSProcessorHandler implements RequestHandler<SQSEvent, SQSBatchRes
         requireField(payload, "timestamp");
 
         long visitorCount = payload.get("visitorCount").asLong();
-        String visitorId  = payload.get("visitorId").asText();
-        String timestamp  = payload.get("timestamp").asText();
+        // Sanitize string fields before logging or including in notifications.
+        // Strips control characters (newlines etc.) to prevent log injection and
+        // email header injection, and caps length to bound log/message size.
+        String visitorId  = sanitize(payload.get("visitorId").asText());
+        String timestamp  = sanitize(payload.get("timestamp").asText());
 
         log.info("Visit event: visitorId={} count={} ts={}", visitorId, visitorCount, timestamp);
 
@@ -114,5 +133,16 @@ public class SQSProcessorHandler implements RequestHandler<SQSEvent, SQSBatchRes
         if (!node.has(fieldName) || node.get(fieldName).isNull()) {
             throw new IllegalArgumentException("Missing required field: " + fieldName);
         }
+    }
+
+    /**
+     * Strips ASCII control characters (0x00–0x1F, 0x7F) from a string and caps
+     * its length at 256 characters.  Prevents log injection (via embedded newlines)
+     * and email-body injection when the value is included in SNS notifications.
+     */
+    private static String sanitize(String input) {
+        if (input == null) return "";
+        String cleaned = input.replaceAll("\\p{Cntrl}", "");
+        return cleaned.length() > 256 ? cleaned.substring(0, 256) : cleaned;
     }
 }

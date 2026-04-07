@@ -166,6 +166,42 @@ class SQSProcessorHandlerTest {
         assertTrue(response.getBatchItemFailures().isEmpty());
     }
 
+    // ── Input sanitization ────────────────────────────────────────────────────
+
+    @Test
+    void visitorIdWithControlChars_sanitizedAndProcessed() {
+        // Embedded newline would allow a log-injection attack; message must still
+        // be processed successfully (not marked as a batch failure).
+        SQSEvent event = eventWithMessages(rawMessage("msg-1",
+                "{\"visitorId\":\"10.0.0.1\\nfake-log-entry\",\"visitorCount\":1,"
+                + "\"timestamp\":\"2024-01-01T00:00:00Z\"}"));
+
+        SQSBatchResponse response = handler.handleRequest(event, context);
+
+        assertTrue(response.getBatchItemFailures().isEmpty());
+        verifyNoInteractions(notificationService);
+    }
+
+    @Test
+    void milestoneWithControlCharInVisitorId_notificationSentWithSanitizedId() {
+        // A CRLF-injection attempt in visitorId (\r\n + fake header) must be stripped
+        // before the value reaches the SNS notification.
+        SQSEvent event = eventWithMessages(rawMessage("msg-1",
+                "{\"visitorId\":\"1.2.3.4\\r\\nBcc:evil@example.com\",\"visitorCount\":100,"
+                + "\"timestamp\":\"2024-01-01T00:00:00Z\"}"));
+
+        SQSBatchResponse response = handler.handleRequest(event, context);
+
+        assertTrue(response.getBatchItemFailures().isEmpty());
+        verify(notificationService).sendNotification(
+                // Subject is a single formatted line — no control chars at all
+                argThat(s -> !s.contains("\r") && !s.contains("\n")),
+                // Body uses %n intentionally for line breaks, but must not contain
+                // \r injected from user input
+                argThat(s -> !s.contains("\r"))
+        );
+    }
+
     // ── MILESTONE_INTERVAL constant ───────────────────────────────────────────
 
     @Test

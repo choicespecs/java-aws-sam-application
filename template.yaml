@@ -102,6 +102,78 @@ Resources:
               StringEquals:
                 AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
 
+  # ── CloudFront Security Response Headers Policy ───────────────────────────
+  #
+  # WHY a ResponseHeadersPolicy: CloudFront adds these headers to every HTTP
+  # response it serves, including cached responses, without requiring Lambda or
+  # any server-side code. This is the correct layer to enforce transport and
+  # content-policy controls for a static site.
+  #
+  # Headers and their purpose:
+  #   HSTS          — Tells browsers to always use HTTPS for this origin for 2
+  #                   years. includeSubDomains covers any subdomains. preload
+  #                   allows submission to browser preload lists.
+  #   X-Content-Type-Options — Prevents browsers from MIME-sniffing responses
+  #                   away from the declared Content-Type, blocking drive-by
+  #                   download attacks that rely on sniffing.
+  #   X-Frame-Options DENY — Prevents this page from being embedded in an
+  #                   <iframe> on any other origin, blocking clickjacking.
+  #   X-XSS-Protection — Legacy header kept for IE 11 compatibility; has no
+  #                   effect on modern browsers which have removed the auditor.
+  #   Referrer-Policy — Sends the full URL on same-origin navigations (useful
+  #                   for your own analytics) but only the origin on cross-origin
+  #                   requests, preventing leakage of the full path/query.
+  #   Content-Security-Policy — Allowlist approach:
+  #                   • default-src 'self': block everything not explicitly allowed
+  #                   • script-src 'self': only scripts from this origin (config.js, app.js)
+  #                   • style-src 'self' 'unsafe-inline': inline <style> block in index.html
+  #                     requires 'unsafe-inline'; removing it would need a separate CSS file
+  #                   • connect-src: only the exact API Gateway endpoint for this stack
+  #                   • frame-ancestors 'none': belt-and-suspenders with X-Frame-Options
+  #                   • object-src 'none': block Flash and other plugins
+  #                   • base-uri 'self': prevent <base href> injection attacks
+  CloudFrontSecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${AWS::StackName}-security-headers"
+        Comment: Security response headers for the visitor counter static site
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 63072000   # 2 years
+            IncludeSubdomains: true
+            Preload: true
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          XSSProtection:
+            ModeBlock: true
+            Protection: true
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          ContentSecurityPolicy:
+            # connect-src uses a regional wildcard rather than the specific API
+            # Gateway ID to avoid a circular CloudFormation dependency:
+            # CloudFrontDistribution → CloudFrontSecurityHeadersPolicy →
+            # VisitorApi → VisitorCounterFunction → CloudFrontDistribution.
+            # *.execute-api.<region>.amazonaws.com is still a meaningful
+            # restriction — it allows only API Gateway endpoints in this region,
+            # not arbitrary third-party URLs.
+            ContentSecurityPolicy: !Sub >-
+              default-src 'self';
+              script-src 'self';
+              style-src 'self' 'unsafe-inline';
+              connect-src https://*.execute-api.${AWS::Region}.amazonaws.com;
+              frame-ancestors 'none';
+              object-src 'none';
+              base-uri 'self'
+            Override: true
+
   # ── CloudFront OAC ────────────────────────────────────────────────────────
   #
   # WHY OAC instead of the older Origin Access Identity (OAI): OAC signs
@@ -150,6 +222,7 @@ Resources:
           # CachingOptimized managed policy — caches based on Accept-Encoding,
           # compresses responses at the edge, suitable for immutable static files.
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          ResponseHeadersPolicyId: !Ref CloudFrontSecurityHeadersPolicy
           AllowedMethods: [GET, HEAD, OPTIONS]
           CachedMethods: [GET, HEAD]
           Compress: true
@@ -366,6 +439,13 @@ Resources:
       CodeUri: .
       Handler: com.example.handlers.VisitorCounterHandler::handleRequest
       Role: !GetAtt VisitorCounterRole.Arn
+      Environment:
+        Variables:
+          # Restricts CORS to the CloudFront origin so that only browsers serving
+          # this site can call the API — other sites cannot silently trigger counts
+          # on their visitors' behalf. Direct non-browser callers (curl, scripts)
+          # are unaffected because they don't enforce CORS.
+          CLOUDFRONT_URL: !Sub "https://${CloudFrontDistribution.DomainName}"
       LoggingConfig:
         LogGroup: !Ref VisitorCounterLogGroup
       Events:
