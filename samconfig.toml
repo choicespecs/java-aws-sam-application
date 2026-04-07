@@ -1,0 +1,40 @@
+version = 0.1
+
+# ── Default environment (prod) ────────────────────────────────────────────────
+[default.global.parameters]
+stack_name = "serverless-visitor-app"
+region = "us-east-1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities     = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+confirm_changeset = true
+resolve_s3       = true
+# Uncomment and set after first deploy to skip the guided prompts:
+# s3_bucket      = "aws-sam-cli-managed-default-samclisourcebucket-xxxxxxxxxxxx"
+# s3_prefix      = "serverless-visitor-app"
+parameter_overrides = "NotificationEmail=\"you@example.com\" Environment=\"prod\" MonthlyBudgetLimit=\"10\""
+
+# ── Dev environment ───────────────────────────────────────────────────────────
+s3_prefix = "serverless-visitor-app"
+image_repositories = []
+disable_rollback = true
+[dev.global.parameters]
+stack_name = "serverless-visitor-app-dev"
+
+[dev.build.parameters]
+cached   = true
+parallel = true
+
+[dev.deploy.parameters]
+capabilities      = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+confirm_changeset = false
+resolve_s3        = true
+region            = "us-east-1"
+parameter_overrides = "Environment=dev MonthlyBudgetLimit=5"

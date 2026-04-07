@@ -1,0 +1,19 @@
+{
+  "httpMethod": "GET",
+  "path": "/visit",
+  "pathParameters": null,
+  "queryStringParameters": null,
+  "headers": {
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+  },
+  "requestContext": {
+    "httpMethod": "GET",
+    "path": "/visit",
+    "identity": {
+      "sourceIp": "127.0.0.1"
+    }
+  },
+  "body": null,
+  "isBase64Encoded": false
+}

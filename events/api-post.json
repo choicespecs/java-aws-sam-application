@@ -1,0 +1,19 @@
+{
+  "httpMethod": "POST",
+  "path": "/visit",
+  "pathParameters": null,
+  "queryStringParameters": null,
+  "headers": {
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+  },
+  "requestContext": {
+    "httpMethod": "POST",
+    "path": "/visit",
+    "identity": {
+      "sourceIp": "203.0.113.42"
+    }
+  },
+  "body": "{}",
+  "isBase64Encoded": false
+}

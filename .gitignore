@@ -22,3 +22,15 @@
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
 replay_pid*
+
+# Maven build output
+target/
+
+# SAM build artifacts
+.aws-sam/
+
+# Generated at deploy time — contains live API URL
+frontend/config.js
+
+# Local SAM env vars (may contain AWS resource ARNs)
+local-env.json

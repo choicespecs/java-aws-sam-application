@@ -1,0 +1,661 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless visitor-counter web app — S3/CloudFront static site, API Gateway,
+  Java Lambda, DynamoDB counter, SQS async queue, SNS email notifications.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address that receives milestone visitor notifications
+    AllowedPattern: "^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$"
+    ConstraintDescription: Must be a valid email address
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  MonthlyBudgetLimit:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: >
+      Monthly AWS spend limit in USD. Alert emails are sent at 80% (forecast)
+      and 100% (actual). Adjust upward if you expect sustained traffic.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Globals
+# ─────────────────────────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: java17
+    Architectures: [x86_64]
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        DYNAMODB_TABLE: !Ref VisitorTable
+        SQS_QUEUE_URL: !Ref VisitorQueue
+        SNS_TOPIC_ARN: !Ref NotificationTopic
+        ENVIRONMENT: !Ref Environment
+    Tags:
+      Project: serverless-visitor-app
+      Environment: !Ref Environment
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── S3: Static Website Storage ────────────────────────────────────────────
+  #
+  # WHY S3: The frontend is a set of static files (HTML, JS, CSS) that never
+  # need a running server to generate. S3 stores them at near-zero cost and
+  # scales infinitely without any capacity planning. There is no EC2 instance
+  # or web server to manage or patch.
+  #
+  # WHY private + OAC instead of public: Blocking all public S3 access forces
+  # every request to go through CloudFront, which means we get HTTPS, caching,
+  # geo-distribution, and WAF capability for free. Direct S3 access would
+  # bypass all of those controls.
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-website-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: serverless-visitor-app
+
+  # WHY a bucket policy instead of ACLs: Bucket policies are evaluated before
+  # object ACLs and support the aws:SourceArn condition, which pins access to
+  # exactly this CloudFront distribution — not any CloudFront distribution in
+  # the account. This is the recommended OAC pattern as of 2023.
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${WebsiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  # ── CloudFront OAC ────────────────────────────────────────────────────────
+  #
+  # WHY OAC instead of the older Origin Access Identity (OAI): OAC signs
+  # requests to S3 with SigV4, which supports server-side encryption (SSE-KMS)
+  # and works with all S3 regions including opt-in regions. OAI uses a legacy
+  # credential model that AWS has frozen and will eventually deprecate.
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ── CloudFront: CDN + HTTPS Termination ───────────────────────────────────
+  #
+  # WHY CloudFront: Three reasons specific to this architecture:
+  #   1. HTTPS enforcement — S3 website hosting only speaks HTTP. CloudFront
+  #      terminates TLS so users always get encrypted connections, and the
+  #      redirect-to-https policy prevents any plaintext requests.
+  #   2. Global edge caching — static assets are served from the edge node
+  #      closest to the visitor, not from a single S3 region. This reduces
+  #      latency for the HTML/JS load that must complete before the API call.
+  #   3. SPA routing — S3 returns 403 (key not found) for deep links like
+  #      /about. The CustomErrorResponse rewrites those to 200/index.html so
+  #      the client-side router can handle the path.
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${AWS::StackName} static website"
+        Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100       # US, Canada, Europe
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""   # Required but empty when using OAC
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          # CachingOptimized managed policy — caches based on Accept-Encoding,
+          # compresses responses at the edge, suitable for immutable static files.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+        CustomErrorResponses:
+          # WHY rewrite 403→200/index.html: S3 returns 403 (not 404) when a key
+          # doesn't exist in a private bucket. Without this rule, navigating
+          # directly to any URL other than "/" would show an AWS XML error page
+          # instead of letting the JavaScript router handle the path.
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+      Tags:
+        - Key: Project
+          Value: serverless-visitor-app
+
+  # ── DynamoDB: Visitor Counter Storage ────────────────────────────────────
+  #
+  # WHY DynamoDB: The counter workload is a single-item atomic increment —
+  # exactly the operation DynamoDB's ADD expression was designed for. No joins,
+  # no transactions across multiple tables, no complex queries are needed, so
+  # a relational database would add cost and operational overhead (VPC, subnet
+  # groups, idle instance charges) without any benefit.
+  #
+  # WHY PAY_PER_REQUEST: Traffic is bursty (zero when no one is visiting) so
+  # provisioned capacity would either over-provision (waste money) or
+  # under-provision (throttle). On-demand billing means we pay per request and
+  # DynamoDB handles any traffic spike automatically.
+  #
+  # WHY DeletionPolicy: Retain: Counter data is the core value this app
+  # produces. A `sam delete` or accidental stack teardown should never destroy
+  # years of accumulated visit history.
+  VisitorTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-visitors"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: serverless-visitor-app
+
+  # ── SQS Dead Letter Queue ─────────────────────────────────────────────────
+  #
+  # WHY a DLQ: When SQSProcessorFunction fails to process a message (e.g.,
+  # malformed payload, SNS outage), SQS retries it up to maxReceiveCount times.
+  # After that, instead of silently discarding the message, SQS moves it here.
+  # The DLQ gives us a durable record of every failed event so we can inspect,
+  # replay, or alert on processing failures without losing data.
+  VisitorQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-visitor-dlq"
+      MessageRetentionPeriod: 1209600  # 14 days — enough time to investigate and replay
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Project
+          Value: serverless-visitor-app
+
+  # ── SQS: Async Decoupling Between API and Notifications ──────────────────
+  #
+  # WHY SQS: The visitor counter HTTP response must be fast. Sending an SNS
+  # email notification is a side-effect that could be slow or fail — we don't
+  # want either of those outcomes to delay or break the API response. SQS
+  # decouples the two: VisitorCounterFunction writes a message and returns
+  # immediately, while SQSProcessorFunction handles the notification
+  # asynchronously and independently.
+  #
+  # This also provides back-pressure resilience: if SNS is temporarily
+  # unavailable, messages accumulate in the queue and are processed once SNS
+  # recovers, instead of being lost or retried synchronously.
+  #
+  # WHY VisibilityTimeout = 180s (6× Lambda timeout): While Lambda is
+  # processing a message, SQS hides it from other consumers. If the timeout
+  # expires before Lambda finishes, SQS assumes the message was not processed
+  # and makes it visible again — causing a duplicate invocation. Setting it to
+  # at least 6× the function timeout is the SAM-recommended safety margin.
+  VisitorQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-visitor-queue"
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 86400   # 1 day — short because events are low-value after processing
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt VisitorQueueDLQ.Arn
+        maxReceiveCount: 3            # Retry up to 3× before sending to DLQ
+      Tags:
+        - Key: Project
+          Value: serverless-visitor-app
+
+  # ── SNS: Fan-out Notifications ────────────────────────────────────────────
+  #
+  # WHY SNS instead of SES or direct email SDK calls: SNS decouples the
+  # notification logic from the delivery mechanism. Today we subscribe one
+  # email address; tomorrow we could add an SMS subscription, a Lambda
+  # subscriber, or an SQS queue for another consumer — all without changing
+  # SQSProcessorFunction. SNS handles the fan-out, retry, and delivery
+  # tracking for each subscriber independently.
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-notifications"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: Project
+          Value: serverless-visitor-app
+
+  # ── API Gateway: CloudWatch Logs account setting ─────────────────────────
+  #
+  # WHY this resource: API Gateway requires an IAM role ARN to be set at the
+  # account level before it can write access logs to CloudWatch Logs. Without
+  # this, the VisitorApiStage creation fails with "CloudWatch Logs role ARN
+  # must be set in account settings". This resource sets that role once for
+  # the whole account. It is idempotent — updating the stack simply refreshes
+  # the setting to the same role ARN.
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-apigw-cloudwatch-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  # ── API Gateway: HTTP Endpoint for the Frontend ───────────────────────────
+  #
+  # WHY API Gateway instead of a Lambda Function URL: API Gateway adds
+  # throttling (rate/burst limits), structured access logging, and CORS
+  # configuration that would otherwise need to be implemented in Lambda code.
+  # It also provides a stable, versioned URL that decouples the frontend from
+  # the Lambda ARN — we can swap the Lambda behind /visit without changing the
+  # URL the frontend calls.
+  #
+  # WHY CORS on the API: The frontend is served from CloudFront
+  # (*.cloudfront.net) and calls an API on execute-api.amazonaws.com — two
+  # different origins. Browsers enforce the Same-Origin Policy and will block
+  # the fetch() call unless the API responds with the correct
+  # Access-Control-Allow-* headers. CORS is configured both here (API Gateway
+  # pre-flight) and in the Lambda response headers (actual response).
+  VisitorApi:
+    Type: AWS::Serverless::Api
+    DependsOn: ApiGatewayAccount
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      StageName: !Ref Environment
+      TracingEnabled: true
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Requested-With'"
+        AllowOrigin: "'*'"
+        MaxAge: "'600'"
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: >
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "method":"$context.httpMethod","path":"$context.path",
+          "status":"$context.status","latency":"$context.responseLatency"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: 100
+          ThrottlingRateLimit: 50
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}"
+      RetentionInDays: 14
+
+  # ── Lambda: VisitorCounterFunction ───────────────────────────────────────
+  #
+  # WHY Lambda instead of a long-running server: The visitor counter API is
+  # idle the vast majority of the time. Lambda charges only for the milliseconds
+  # it actually runs, so the cost for a low-to-medium traffic site is fractions
+  # of a cent per day. There is no idle server to pay for, patch, or monitor.
+  #
+  # WHY a separate function for the API (vs. one function for everything):
+  # Separating the synchronous API handler from the async SQS processor means
+  # each function has a tightly scoped IAM role and can be scaled, monitored,
+  # and deployed independently. A bug in the notification logic cannot affect
+  # the API's ability to serve the counter.
+  VisitorCounterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-visitor-counter"
+      CodeUri: .
+      Handler: com.example.handlers.VisitorCounterHandler::handleRequest
+      Role: !GetAtt VisitorCounterRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref VisitorCounterLogGroup
+      Events:
+        GetVisitors:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VisitorApi
+            Path: /visit
+            Method: GET
+        PostVisit:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VisitorApi
+            Path: /visit
+            Method: POST
+        OptionsVisit:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VisitorApi
+            Path: /visit
+            Method: OPTIONS
+
+  VisitorCounterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-visitor-counter"
+      RetentionInDays: 14
+
+  # ── Lambda: SQSProcessorFunction ─────────────────────────────────────────
+  #
+  # WHY a dedicated Lambda for SQS processing: Lambda's SQS event source
+  # mapping automatically handles polling, batching, visibility timeouts, and
+  # partial batch failure reporting — we write zero queue-management code.
+  # Lambda scales the number of concurrent executions based on queue depth,
+  # so a sudden spike in visitors doesn't cause a notification backlog.
+  #
+  # WHY ReportBatchItemFailures: Without this, if one message in a 10-message
+  # batch fails, Lambda must either mark the entire batch as failed (causing
+  # 9 already-processed messages to be retried) or swallow the error silently.
+  # ReportBatchItemFailures lets us return the exact message IDs that failed,
+  # so only those are retried — avoiding duplicate notifications for visitors
+  # whose events were processed successfully.
+  SQSProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-sqs-processor"
+      CodeUri: .
+      Handler: com.example.handlers.SQSProcessorHandler::handleRequest
+      Role: !GetAtt SQSProcessorRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref SQSProcessorLogGroup
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt VisitorQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  SQSProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-sqs-processor"
+      RetentionInDays: 14
+
+  # ── AWS Budget: Monthly Spend Alert ──────────────────────────────────────
+  #
+  # WHY a Budget resource: Reserved concurrency caps compute, but it doesn't
+  # cover CloudFront data transfer, CloudWatch Logs ingestion, or any future
+  # resources added to the stack. A budget provides a catch-all safety net that
+  # emails the operator before the monthly bill becomes a surprise.
+  #
+  # Two notifications are configured:
+  #   • 80% FORECASTED — warns early enough to investigate and act before the
+  #     limit is reached (forecasted spend extrapolates current usage to end of
+  #     month, so this can fire mid-month).
+  #   • 100% ACTUAL — fires when real charges have already crossed the limit,
+  #     as a final alert if the forecast notification was missed or dismissed.
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-monthly-budget"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetLimit
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref NotificationEmail
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref NotificationEmail
+
+  # ── CloudWatch Alarm: Lambda invocation spike ─────────────────────────────
+  #
+  # WHY this alarm: Reserved concurrency throttles Lambda silently. This alarm
+  # makes a traffic spike or abuse pattern visible before it is noticed on the
+  # bill. 1 000 invocations in a 10-minute window equates to ~1.7 req/s
+  # sustained — well above normal usage for a personal visitor counter but
+  # comfortably below the 50 req/s API Gateway rate limit, so legitimate bursts
+  # won't false-positive. Adjust the threshold if you expect higher organic
+  # traffic (e.g. a post goes viral).
+  LambdaInvocationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-lambda-invocation-spike"
+      AlarmDescription: >
+        VisitorCounterFunction received an unusually high number of invocations.
+        Possible causes: traffic spike, crawler, or abuse. Check CloudWatch Logs
+        and consider tightening API Gateway throttling or adding WAF rules.
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref VisitorCounterFunction
+      Statistic: Sum
+      Period: 600          # 10-minute window
+      EvaluationPeriods: 1
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopic
+      OKActions:
+        - !Ref NotificationTopic
+
+  # ── CloudWatch Alarm: DLQ depth ───────────────────────────────────────────
+  #
+  # WHY this alarm: A non-zero DLQ depth means SQSProcessorFunction is failing
+  # repeatedly. Each failed message is retried up to 3× (maxReceiveCount), each
+  # retry invokes Lambda, and each Lambda invocation costs money. More
+  # importantly, a growing DLQ signals a bug or downstream outage that should
+  # be investigated — catching it early prevents both runaway retry costs and
+  # missed milestone notifications.
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-dlq-messages"
+      AlarmDescription: >
+        Messages have accumulated in the Dead Letter Queue. This means
+        SQSProcessorFunction failed to process them after 3 retries. Inspect
+        the DLQ messages and SQSProcessorFunction logs to find the root cause.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt VisitorQueueDLQ.QueueName
+      Statistic: Sum
+      Period: 300          # 5-minute window
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  # ── IAM Role: VisitorCounterFunction ─────────────────────────────────────
+  #
+  # WHY inline policy (not managed): This role's permissions are specific to
+  # this stack's resources. An inline policy keeps the permissions co-located
+  # with the role definition so the full security posture is visible in one
+  # place, and it prevents the policy from being accidentally attached to
+  # unrelated roles.
+  #
+  # WHY only GetItem + UpdateItem + PutItem (not dynamodb:*): The API function
+  # never deletes or scans the table. Granting only the operations it actually
+  # performs limits blast radius if the function's credentials were ever
+  # compromised — an attacker could not wipe the table via this role.
+  #
+  # WHY only sqs:SendMessage (not sqs:*): This function is a producer only.
+  # Granting ReceiveMessage or DeleteMessage would give it the ability to
+  # consume and remove messages it placed — an unintended capability that could
+  # cause silent data loss if triggered accidentally.
+  VisitorCounterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-visitor-counter-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VisitorCounterInlinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt VisitorTable.Arn
+              - Sid: SQSSendMessage
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt VisitorQueue.Arn
+
+  # ── IAM Role: SQSProcessorFunction ───────────────────────────────────────
+  #
+  # WHY ReceiveMessage + DeleteMessage + GetQueueAttributes + ChangeMessageVisibility
+  # (not sqs:*): These four actions are the exact set Lambda's SQS event source
+  # mapping needs to poll, process, and acknowledge messages. Nothing more.
+  # Notably absent: sqs:SendMessage — this function never produces messages,
+  # so granting it would be an unnecessary privilege.
+  #
+  # WHY only sns:Publish on this specific topic ARN: Scoping the resource to
+  # the exact topic ARN means the processor cannot publish to any other SNS
+  # topic in the account, even if one with a similar name is created later.
+  SQSProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-sqs-processor-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSProcessorInlinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SQSConsume
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt VisitorQueue.Arn
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+  WebsiteUrl:
+    Description: CloudFront URL for the static website
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-WebsiteUrl"
+
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${VisitorApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiUrl"
+
+  WebsiteBucketName:
+    Description: S3 bucket name for frontend deployment
+    Value: !Ref WebsiteBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-WebsiteBucket"
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (for cache invalidation)
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontDistributionId"
+
+  DLQUrl:
+    Description: Dead letter queue URL for monitoring failed messages
+    Value: !Ref VisitorQueueDLQ

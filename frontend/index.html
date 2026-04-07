@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Serverless Visitor Counter</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0f172a;
+      --surface:   #1e293b;
+      --border:    #334155;
+      --accent:    #6366f1;
+      --accent-h:  #818cf8;
+      --success:   #22c55e;
+      --error:     #ef4444;
+      --text:      #f1f5f9;
+      --muted:     #94a3b8;
+      --radius:    12px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 48px 40px;
+      max-width: 480px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 25px 50px -12px rgba(0,0,0,.5);
+    }
+
+    .badge {
+      display: inline-block;
+      background: rgba(99,102,241,.15);
+      color: var(--accent-h);
+      border: 1px solid rgba(99,102,241,.3);
+      border-radius: 999px;
+      font-size: .75rem;
+      font-weight: 600;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+      padding: 4px 12px;
+      margin-bottom: 20px;
+    }
+
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 700;
+      line-height: 1.2;
+      margin-bottom: 8px;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: .9rem;
+      margin-bottom: 40px;
+    }
+
+    /* ── Counter display ─────────────────────────────────── */
+    .counter-wrap {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px 20px;
+      margin-bottom: 24px;
+    }
+
+    .counter-label {
+      font-size: .75rem;
+      font-weight: 600;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    #visitor-count {
+      font-size: 4rem;
+      font-weight: 800;
+      color: var(--accent-h);
+      font-variant-numeric: tabular-nums;
+      line-height: 1;
+      transition: transform .15s ease, color .15s ease;
+    }
+
+    #visitor-count.bump {
+      transform: scale(1.12);
+      color: var(--success);
+    }
+
+    /* ── Button ──────────────────────────────────────────── */
+    #visit-btn {
+      width: 100%;
+      padding: 14px 24px;
+      border: none;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background .15s ease, transform .1s ease;
+      margin-bottom: 16px;
+    }
+
+    #visit-btn:hover:not(:disabled)  { background: var(--accent-h); }
+    #visit-btn:active:not(:disabled) { transform: scale(.97); }
+    #visit-btn:disabled { opacity: .55; cursor: not-allowed; }
+
+    /* ── Status message ──────────────────────────────────── */
+    #status-msg {
+      min-height: 24px;
+      font-size: .85rem;
+      border-radius: 6px;
+      padding: 4px 0;
+      transition: opacity .2s ease;
+    }
+
+    #status-msg.success { color: var(--success); }
+    #status-msg.error   { color: var(--error); }
+    #status-msg.info    { color: var(--muted); }
+
+    /* ── Stack info ───────────────────────────────────────── */
+    .info-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 32px;
+    }
+
+    .info-item {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      font-size: .78rem;
+    }
+
+    .info-item .label { color: var(--muted); margin-bottom: 2px; }
+    .info-item .value { font-weight: 600; color: var(--text); word-break: break-all; }
+
+    footer {
+      margin-top: 40px;
+      color: var(--muted);
+      font-size: .78rem;
+    }
+
+    footer a { color: var(--accent-h); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+
+    /* ── Config warning banner ───────────────────────────── */
+    #config-warning {
+      display: none;
+      background: rgba(239,68,68,.1);
+      border: 1px solid rgba(239,68,68,.4);
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-bottom: 20px;
+      font-size: .82rem;
+      color: #fca5a5;
+      text-align: left;
+    }
+
+    #config-warning code {
+      background: rgba(239,68,68,.2);
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="card">
+  <div class="badge">Serverless Demo</div>
+  <h1>Visitor Counter</h1>
+  <p class="subtitle">Powered by API Gateway &rarr; Lambda &rarr; DynamoDB</p>
+
+  <div id="config-warning">
+    <strong>Configuration needed:</strong> API endpoint not set.<br/>
+    Deploy the stack and run the frontend deploy script to generate <code>config.js</code>,
+    or create it manually: <code>window.API_BASE_URL = "https://&lt;api-id&gt;.execute-api.&lt;region&gt;.amazonaws.com/prod";</code>
+  </div>
+
+  <div class="counter-wrap">
+    <div class="counter-label">Total Visitors</div>
+    <div id="visitor-count" aria-live="polite">–</div>
+  </div>
+
+  <button id="visit-btn">Register My Visit</button>
+  <div id="status-msg" class="info"></div>
+
+  <div class="info-grid">
+    <div class="info-item">
+      <div class="label">Storage</div>
+      <div class="value">DynamoDB</div>
+    </div>
+    <div class="info-item">
+      <div class="label">Queue</div>
+      <div class="value">SQS + DLQ</div>
+    </div>
+    <div class="info-item">
+      <div class="label">Notifications</div>
+      <div class="value">SNS Email</div>
+    </div>
+    <div class="info-item">
+      <div class="label">CDN</div>
+      <div class="value">CloudFront</div>
+    </div>
+  </div>
+</div>
+
+<footer>
+  AWS SAM &bull; Java 17 &bull;
+  <a href="https://docs.aws.amazon.com/serverless-application-model/" target="_blank" rel="noopener">
+    SAM docs
+  </a>
+</footer>
+
+<!--
+  app.js references window.API_BASE_URL.
+  config.js is generated by the deploy script and sets that variable.
+  During development you can create frontend/config.js manually:
+    window.API_BASE_URL = "https://<api-id>.execute-api.<region>.amazonaws.com/prod";
+-->
+<script src="config.js"></script>
+<script src="app.js"></script>
+
+</body>
+</html>
